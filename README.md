@@ -455,6 +455,109 @@ https://github.com/user-attachments/assets/de5f25e1-a967-4362-9e04-616449e745e5
 
 https://github.com/user-attachments/assets/c7ed496d-0cf7-45d6-9853-e349f1abd6f8
 
+<div id='s3-media'/>
+
+## <img src="https://user-images.githubusercontent.com/25985824/106288517-2422e000-6216-11eb-871d-26ad2e7b1e59.png" height="20px"> &nbsp; s3 media & cvat &nbsp; ☁️
+
+FiftyOne reads media from local disk, so S3-hosted media is mirrored into a
+local cache while S3 remains the source of truth: each sample's `filepath`
+points to a cached copy at `<cache-dir>/<bucket>/<key>`, and its `s3_uri` field
+stores the source `s3://<bucket>/<key>`.
+
+**Setup.** AWS credentials, region, and endpoint are resolved by boto3's
+standard chain (`AWS_PROFILE`, `AWS_REGION`, `~/.aws/config`,
+`~/.aws/credentials`, instance roles). For S3-compatible services such as
+MinIO, set `AWS_ENDPOINT_URL_S3` or pass `--endpoint-url`.
+
+**Config.** The cache defaults to `~/fiftyone/__s3_cache__` and can be changed
+via `fo.config.s3_cache_dir`. CVAT settings can also be stored in
+`~/.fiftyone/annotation_config.json`:
+
+```shell
+export FIFTYONE_S3_CACHE_DIR=<cache-dir>  # optional
+
+export FIFTYONE_CVAT_URL=https://<cvat-server>
+export FIFTYONE_CVAT_USERNAME=<username>
+export FIFTYONE_CVAT_PASSWORD=<password>
+```
+
+A default `FIFTYONE_CVAT_CLOUD_STORAGE_ID` can be set too, but it then applies
+to every `annotate()` call, so pass `cloud_storage_id=None` when annotating
+datasets whose media is not in that bucket.
+
+**Sync media.** `fiftyone utils sync-s3-media` downloads missing objects to the
+cache and points each sample's `filepath` at its cached copy. Empty `s3_uri`
+values are backfilled from existing filepaths (S3 URIs, cached paths, or local
+copies via `--local-root`/`--s3-root`); existing values are never modified.
+Re-running it is safe:
+
+```shell
+# Create or extend a dataset with the images under an S3 prefix
+fiftyone utils sync-s3-media <dataset-name> --prefix s3://<bucket>/<prefix>/
+
+# Add the objects listed in a file, one S3 URI per line
+fiftyone utils sync-s3-media <dataset-name> --uris-file <uris.txt>
+
+# Re-sync an existing dataset (e.g., on a new machine), re-downloading cached
+# files whose size or ETag no longer match S3
+fiftyone utils sync-s3-media <dataset-name> --validate etag
+
+# Migrate a dataset whose filepaths are local copies of S3 objects
+fiftyone utils sync-s3-media <dataset-name> \
+    --local-root <local-dir> --s3-root s3://<bucket>/<prefix> --dry-run
+fiftyone utils sync-s3-media <dataset-name> \
+    --local-root <local-dir> --s3-root s3://<bucket>/<prefix>
+```
+
+In Python, use `add_s3_samples()` and `sync_s3_samples()`:
+
+```py
+import fiftyone.utils.aws as fouaws
+
+fouaws.add_s3_samples(dataset, "s3://<bucket>/<prefix>/")  # or a list of URIs
+summary = fouaws.sync_s3_samples(dataset, validate="etag")
+```
+
+**Annotate in CVAT.** Pass `media_field="s3_uri"` and the ID of the CVAT cloud
+storage that points to your bucket, and CVAT reads the images from S3 rather
+than receiving uploaded copies. Frames are matched to samples by S3 object key,
+so each object may appear only once per task. This requires CVAT 2.4.5 or later
+and image datasets. If CVAT's copy of an image differs in size from the cached
+one, the task is deleted and an error asks you to re-sync with
+`--validate etag`:
+
+```py
+anno_key = "cvat_edits"
+
+dataset.annotate(
+    anno_key,
+    backend="cvat",
+    label_field="ground_truth",
+    media_field="s3_uri",
+    cloud_storage_id=<cloud-storage-id>,  # the ID shown in CVAT
+    launch_editor=True,
+)
+
+# Edit the labels in CVAT, then
+dataset.load_annotations(anno_key)
+```
+
+To import a task created directly in CVAT from the cloud storage, map its frame
+names, which are object keys, to the samples' filepaths:
+
+```py
+import fiftyone.utils.cvat as fouc
+
+uris, filepaths = dataset.exists("s3_uri").values(["s3_uri", "filepath"])
+data_path = {fouaws.parse_s3_uri(u)[1]: f for u, f in zip(uris, filepaths)}
+
+fouc.import_annotations(dataset, task_ids=[<task-id>], data_path=data_path)
+```
+
+See [docs/source/integrations/cvat.rst](docs/source/integrations/cvat.rst)
+("Reading media from cloud storage") and the `sync-s3-media` entry of
+[docs/source/cli/index.rst](docs/source/cli/index.rst) for details.
+
 <div id='getting-started'/>
 
 ## <img src="https://user-images.githubusercontent.com/25985824/106288517-2422e000-6216-11eb-871d-26ad2e7b1e59.png" height="20px"> &nbsp; documentation &nbsp; 🪪

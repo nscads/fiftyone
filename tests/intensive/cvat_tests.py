@@ -5,6 +5,15 @@ You must run these tests interactively as follows::
 
     python tests/intensive/cvat_tests.py
 
+The cloud storage tests are skipped unless you also provide the ID of a cloud
+storage that is attached to the CVAT server, and an S3 prefix in its bucket
+that contains at least two images that your AWS credentials can read::
+
+    export FIFTYONE_TEST_CVAT_CLOUD_STORAGE_ID=1
+    export FIFTYONE_TEST_S3_PREFIX=s3://bucket/path/to/images/
+
+    pytest tests/intensive/cvat_tests.py -k cloud_storage
+
 | Copyright 2017-2026, Voxel51, Inc.
 | `voxel51.com <https://voxel51.com/>`_
 |
@@ -22,6 +31,7 @@ import pytest
 import eta.core.utils as etau
 
 import fiftyone as fo
+import fiftyone.utils.aws as fouaws
 import fiftyone.utils.cvat as fouc
 import fiftyone.zoo as foz
 
@@ -1931,6 +1941,144 @@ class CVATTests(unittest.TestCase):
                 "frames.frame_number", unwind=True
             ),
         )
+
+    @pytest.mark.timeout(600)
+    @unittest.skipUnless(
+        os.environ.get("FIFTYONE_TEST_CVAT_CLOUD_STORAGE_ID")
+        and os.environ.get("FIFTYONE_TEST_S3_PREFIX"),
+        "Set FIFTYONE_TEST_CVAT_CLOUD_STORAGE_ID and FIFTYONE_TEST_S3_PREFIX to "
+        "test CVAT cloud storages",
+    )
+    def test_cloud_storage_round_trip(self):
+        # Requires a CVAT cloud storage whose bucket contains at least two
+        # images under the given prefix, which this machine's AWS credentials
+        # must also be able to read
+        cloud_storage_id = int(
+            os.environ["FIFTYONE_TEST_CVAT_CLOUD_STORAGE_ID"]
+        )
+        prefix = os.environ["FIFTYONE_TEST_S3_PREFIX"]
+
+        s3_uris = sorted(fouaws.list_s3_uris(prefix))
+        self.assertGreaterEqual(
+            len(s3_uris), 2, "Found fewer than 2 images in '%s'" % prefix
+        )
+
+        # Add the samples in reverse key order, so that their order differs
+        # from that of the task's frames when CVAT sorts them by name
+        s3_uris = s3_uris[:2][::-1]
+        keys = [fouaws.parse_s3_uri(s3_uri)[1] for s3_uri in s3_uris]
+
+        anno_key = "cloud_storage"
+        dataset = fo.Dataset()
+        results = None
+        with etau.TempDir() as cache_dir:
+            try:
+                fouaws.add_s3_samples(dataset, s3_uris, cache_dir=cache_dir)
+                self.assertListEqual(dataset.values("s3_uri"), s3_uris)
+
+                sample = dataset.first()
+                detection = fo.Detection(
+                    label="cat", bounding_box=[0.1, 0.1, 0.2, 0.2]
+                )
+                sample["ground_truth"] = fo.Detections(detections=[detection])
+                sample.save()
+
+                results = dataset.annotate(
+                    anno_key,
+                    backend="cvat",
+                    label_field="ground_truth",
+                    classes=["cat", "dog"],
+                    media_field="s3_uri",
+                    cloud_storage_id=cloud_storage_id,
+                )
+
+                with results:
+                    api = results.connect_to_api()
+                    self.assertEqual(len(results.task_ids), 1)
+                    task_id = results.task_ids[0]
+
+                    task = api.get(api.task_url(task_id)).json()
+                    if task.get("cloud_storage_id", None) is not None:
+                        self.assertEqual(
+                            task["cloud_storage_id"], cloud_storage_id
+                        )
+
+                    # CVAT names the frames by object key
+                    meta = api.get(api.task_data_meta_url(task_id)).json()
+                    frames = meta["frames"]
+                    names = [frame["name"] for frame in frames]
+                    self.assertListEqual(sorted(names), sorted(keys))
+
+                    # Frames are mapped to the samples with the same keys
+                    sample_ids = dict(zip(keys, dataset.values("id")))
+                    frame_id_map = results.frame_id_map[task_id]
+                    self.assertEqual(len(frame_id_map), len(names))
+                    for frame_id, frame_data in frame_id_map.items():
+                        name = names[frame_id]
+                        self.assertEqual(frame_data["name"], name)
+                        self.assertEqual(
+                            frame_data["sample_id"], sample_ids[name]
+                        )
+
+                    # The existing label is on the frame of its sample
+                    shape = _get_shape(api, task_id, detection.id)
+                    self.assertIsNotNone(shape)
+                    self.assertEqual(names[shape["frame"]], keys[0])
+
+                    frame = frames[shape["frame"]]
+                    width, height = frame["width"], frame["height"]
+                    expected_points = [
+                        0.1 * width,
+                        0.1 * height,
+                        0.3 * width,
+                        0.3 * height,
+                    ]
+                    for actual, expected in zip(
+                        shape["points"], expected_points
+                    ):
+                        self.assertAlmostEqual(actual, expected, delta=1)
+
+                    # Relabel the object and move its box
+                    points = [
+                        0.5 * width,
+                        0.4 * height,
+                        0.9 * width,
+                        0.8 * height,
+                    ]
+                    _update_shape(
+                        api,
+                        task_id,
+                        detection.id,
+                        label="dog",
+                        points=points,
+                        attributes=[],
+                    )
+
+                    dataset.load_annotations(anno_key)
+
+                dataset.reload()
+
+                edited = dataset.one(F("s3_uri") == s3_uris[0])
+                self.assertEqual(len(edited.ground_truth.detections), 1)
+                edited_detection = edited.ground_truth.detections[0]
+                self.assertEqual(edited_detection.id, detection.id)
+                self.assertEqual(edited_detection.label, "dog")
+                for actual, expected in zip(
+                    edited_detection.bounding_box, [0.5, 0.4, 0.4, 0.4]
+                ):
+                    self.assertAlmostEqual(actual, expected, places=3)
+
+                other = dataset.one(F("s3_uri") == s3_uris[1])
+                if other.ground_truth is not None:
+                    self.assertListEqual(other.ground_truth.detections, [])
+            finally:
+                if results is not None:
+                    results.cleanup()
+
+                if dataset.has_annotation_run(anno_key):
+                    dataset.delete_annotation_run(anno_key)
+
+                dataset.delete()
 
 
 if __name__ == "__main__":

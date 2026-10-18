@@ -153,6 +153,11 @@ FiftyOne supports the configuration options described below:
 | `plugins_cache_enabled`                  | `FIFTYONE_PLUGINS_CACHE_ENABLED`                | `False`                       | When set to ``True`` plugins will be cached until their directory's ``mtime`` changes. |
 |                                          |                                                 |                               | This is intended to be used in production.                                             |
 +------------------------------------------+-------------------------------------------------+-------------------------------+----------------------------------------------------------------------------------------+
+| `s3_cache_dir`                           | `FIFTYONE_S3_CACHE_DIR`                         | `~/fiftyone/__s3_cache__`     | The directory in which to cache media downloaded from S3 by the                        |
+|                                          |                                                 |                               | :ref:`sync-s3-media <cli-fiftyone-utils-sync-s3-media>` command and the                |
+|                                          |                                                 |                               | :mod:`fiftyone.utils.aws` utilities. Objects are cached at `<bucket>/<key>` paths      |
+|                                          |                                                 |                               | within it. Defaults to `__s3_cache__` within `default_dataset_dir`.                    |
++------------------------------------------+-------------------------------------------------+-------------------------------+----------------------------------------------------------------------------------------+
 | `show_progress_bars`                     | `FIFTYONE_SHOW_PROGRESS_BARS`                   | `True`                        | Controls whether progress bars are printed to the terminal when performing             |
 |                                          |                                                 |                               | operations such reading/writing large datasets or activating FiftyOne                  |
 |                                          |                                                 |                               | Brain methods on datasets.                                                             |
@@ -224,6 +229,7 @@ and the CLI:
             "plugins_cache_enabled": false,
             "plugins_dir": null,
             "requirement_error_level": 0,
+            "s3_cache_dir": "~/fiftyone/__s3_cache__",
             "show_progress_bars": true,
             "singleton_cache": true,
             "timezone": null
@@ -279,6 +285,7 @@ and the CLI:
             "plugins_cache_enabled": false,
             "plugins_dir": null,
             "requirement_error_level": 0,
+            "s3_cache_dir": "~/fiftyone/__s3_cache__",
             "show_progress_bars": true,
             "singleton_cache": true,
             "timezone": null

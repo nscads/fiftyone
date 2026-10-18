@@ -5012,7 +5012,8 @@ class SyncS3MediaCommand(Command):
 
     Samples of an existing dataset whose S3 URI field is empty are backfilled
     from their current filepath, so this command also migrates existing
-    datasets. Existing S3 URI values are never modified.
+    datasets. Existing S3 URI values are never modified, and objects that a
+    sample already references are never added again.
 
     AWS credentials, region, and endpoint are resolved by boto3's standard
     configuration chain (`AWS_PROFILE`, `AWS_REGION`, `~/.aws/`, etc) unless
@@ -5155,6 +5156,14 @@ class SyncS3MediaCommand(Command):
 
     @staticmethod
     def execute(parser, args):
+        if (args.s3_root is None) != (args.local_root is None):
+            parser.error(
+                "`--s3-root` and `--local-root` must be used together"
+            )
+
+        if args.s3_root is not None and not fouaws.is_s3_uri(args.s3_root):
+            parser.error("Invalid `--s3-root` '%s'" % args.s3_root)
+
         client = fouaws.get_s3_client(
             profile=args.profile,
             region=args.region,
@@ -5177,6 +5186,7 @@ class SyncS3MediaCommand(Command):
                 )
             )
 
+        s3_uris = list(dict.fromkeys(s3_uris))
         add_uris = bool(args.uris or args.uris_file or args.prefix)
 
         if fod.dataset_exists(args.name):
@@ -5189,34 +5199,23 @@ class SyncS3MediaCommand(Command):
         elif args.dry_run:
             print(
                 "Dataset '%s' would be created with %d sample(s)"
-                % (args.name, len(set(s3_uris)))
+                % (args.name, len(s3_uris))
             )
             return
         else:
             dataset = fod.Dataset(args.name, persistent=True)
 
+        # Objects that existing samples already reference are not added again,
+        # even if their URIs are only inferred by the sync below
         if add_uris:
-            if args.dry_run:
-                existing = set()
-                if dataset.has_sample_field(args.uri_field):
-                    existing = set(dataset.distinct(args.uri_field))
-
-                num_new = len(set(s3_uris) - existing)
-                print("%d sample(s) would be added" % num_new)
-            else:
-                sample_ids = fouaws.add_s3_samples(
-                    dataset,
-                    s3_uris,
-                    uri_field=args.uri_field,
-                    cache_dir=args.cache_dir,
-                    validate=args.validate,
-                    compute_metadata=args.compute_metadata,
-                    num_workers=args.num_workers,
-                    max_attempts=args.max_attempts,
-                    skip_failures=args.skip_failures,
-                    client=client,
-                )
-                print("Added %d sample(s)" % len(sample_ids))
+            known = fouaws._get_known_s3_uris(
+                dataset,
+                args.uri_field,
+                args.cache_dir,
+                local_root=args.local_root,
+                s3_root=args.s3_root,
+            )
+            s3_uris = [u for u in s3_uris if u not in known]
 
         summary = fouaws.sync_s3_samples(
             dataset,
@@ -5233,7 +5232,24 @@ class SyncS3MediaCommand(Command):
             client=client,
         )
 
-        _print_dict_as_table(summary)
+        if args.dry_run or not s3_uris:
+            num_added = len(s3_uris)
+        else:
+            sample_ids = fouaws.add_s3_samples(
+                dataset,
+                s3_uris,
+                uri_field=args.uri_field,
+                cache_dir=args.cache_dir,
+                validate=args.validate,
+                compute_metadata=args.compute_metadata,
+                num_workers=args.num_workers,
+                max_attempts=args.max_attempts,
+                skip_failures=args.skip_failures,
+                client=client,
+            )
+            num_added = len(sample_ids)
+
+        _print_dict_as_table({"num_added": num_added, **summary})
 
 
 class TransformImagesCommand(Command):

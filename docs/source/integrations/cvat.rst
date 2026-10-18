@@ -500,6 +500,12 @@ provided:
     in reduced video quality in CVAT due to size limitations on ZIP files that
     can be uploaded to CVAT
 -   **chunk_size** (*None*): the number of frames to upload per ZIP chunk
+-   **cloud_storage_id** (*None*): the ID of a cloud storage attached to the
+    CVAT server from which CVAT should read the media, rather than uploading
+    copies of it. When provided, `media_field` must contain cloud object URIs
+    like `s3://bucket/path/to/image.jpg` in the bucket of the cloud storage.
+    Only image collections are supported. See
+    :ref:`this section <cvat-cloud-storage>` for more details
 -   **task_assignee** (*None*): the username to assign the generated tasks.
     This argument can be a list of usernames when annotating videos as each
     video is uploaded to a separate task
@@ -2015,6 +2021,144 @@ For example, let's upload some blurred images to CVAT for annotation:
 .. image:: /images/integrations/cvat_alt_media.png
    :alt: cvat-alt-media
    :align: center
+
+.. _cvat-cloud-storage:
+
+Reading media from cloud storage
+--------------------------------
+
+If your media is stored in a cloud bucket such as S3 that is
+`attached to your CVAT server <https://opencv.github.io/cvat/docs/manual/basics/attach-cloud-storage/>`_
+as a cloud storage, you can instruct CVAT to read the media directly from the
+bucket, rather than uploading copies of it, by passing the integer ID of the
+cloud storage via the `cloud_storage_id` parameter of
+:meth:`annotate() <fiftyone.core.collections.SampleCollection.annotate>`.
+
+FiftyOne itself works with local media, so the recommended setup is to store a
+local copy of each object in the `filepath` field of your samples and the
+object's cloud URI, like `s3://<bucket>/<key>`, in a separate field that you
+pass as the `media_field`. The
+:func:`add_s3_samples() <fiftyone.utils.aws.add_s3_samples>` and
+:func:`sync_s3_samples() <fiftyone.utils.aws.sync_s3_samples>` utilities, and
+the :ref:`fiftyone utils sync-s3-media <cli-fiftyone-utils-sync-s3-media>`
+command, maintain this layout for you: they download S3 objects to a local
+cache that mirrors their bucket/key structure, set each sample's `filepath` to
+its cached path, and store its S3 URI in an `s3_uri` field.
+
+.. code:: python
+    :linenos:
+
+    import fiftyone as fo
+    import fiftyone.utils.aws as fouaws
+
+    dataset = fo.Dataset()
+
+    # Download the images under an S3 prefix to the local cache and store
+    # their S3 URIs in the `s3_uri` field
+    fouaws.add_s3_samples(dataset, "s3://<bucket>/<prefix>/")
+
+    # Or, populate the `s3_uri` field and the local cache of an existing
+    # dataset whose filepaths are S3 URIs or cached paths
+    # fouaws.sync_s3_samples(dataset)
+
+    anno_key = "cvat_cloud_storage"
+
+    dataset.annotate(
+        anno_key,
+        label_field="ground_truth",
+        label_type="detections",
+        classes=["cat", "dog"],
+        media_field="s3_uri",
+        cloud_storage_id=1,  # the ID of the cloud storage in CVAT
+        launch_editor=True,
+    )
+    print(dataset.get_annotation_info(anno_key))
+
+    # Create annotations in CVAT
+
+    dataset.load_annotations(anno_key, cleanup=True)
+    dataset.delete_annotation_run(anno_key)
+
+The local cache is stored in the directory defined by the `s3_cache_dir`
+property of your :ref:`FiftyOne config <configuring-fiftyone>`, which defaults
+to `~/fiftyone/__s3_cache__` and can be customized via the
+`FIFTYONE_S3_CACHE_DIR` environment variable. AWS credentials, region, and
+endpoint are resolved by boto3's standard configuration chain (`AWS_PROFILE`,
+`AWS_REGION`, `AWS_ENDPOINT_URL_S3`, `~/.aws/config`, etc).
+
+When `cloud_storage_id` is provided, the following apply:
+
+-   CVAT 2.4.5 or later is required, and only image collections are
+    supported
+-   The `media_field` must contain cloud object URIs like
+    `s3://<bucket>/<key>` in the bucket of the cloud storage, and, if the
+    cloud storage has a prefix, under that prefix. FiftyOne checks this
+    before creating any tasks
+-   Each object may only appear once in the collection being annotated, since
+    CVAT cannot add the same object to a task multiple times
+-   CVAT reads the images via its cache, so `use_cache=True` is always used
+-   The frames of the tasks are named by their object keys, so FiftyOne maps
+    frames to samples by object key rather than by upload order, both when
+    uploading existing labels and when loading annotations
+-   Existing labels are converted to pixel coordinates via the metadata of
+    the local copies, so the size of each image in CVAT must match the
+    sample's metadata. If it does not, for example because an object changed
+    since it was cached, an error is raised and you can re-sync the cache via
+    `fiftyone utils sync-s3-media <dataset-name> --validate etag`
+-   If CVAT cannot read the media, for example because an object is missing
+    from the bucket or CVAT lacks permission to read it, or the frames of a
+    task cannot be matched to the samples, the tasks that were created are
+    deleted and an error is raised
+
+You can also provide a default cloud storage ID by setting the
+`FIFTYONE_CVAT_CLOUD_STORAGE_ID` environment variable:
+
+.. code-block:: shell
+
+    export FIFTYONE_CVAT_CLOUD_STORAGE_ID=1
+
+or by storing it in your :ref:`annotation config <annotation-config>` at
+`~/.fiftyone/annotation_config.json`:
+
+.. code-block:: json
+
+    {
+        "backends": {
+            "cvat": {
+                "cloud_storage_id": 1
+            }
+        }
+    }
+
+In this case, you must still provide the `media_field` that contains the
+cloud URIs each time you call
+:meth:`annotate() <fiftyone.core.collections.SampleCollection.annotate>`, and
+you must pass `cloud_storage_id=None` when annotating collections whose media
+is not in the cloud storage.
+
+To :ref:`import <cvat-existing-tasks>` the annotations of a task that was
+created directly in CVAT from a cloud storage, map the task's frame names,
+which are object keys, to the filepaths of your samples:
+
+.. code:: python
+    :linenos:
+
+    import fiftyone.utils.aws as fouaws
+    import fiftyone.utils.cvat as fouc
+
+    uris, filepaths = dataset.exists("s3_uri").values(["s3_uri", "filepath"])
+    data_path = {
+        fouaws.parse_s3_uri(uri)[1]: filepath
+        for uri, filepath in zip(uris, filepaths)
+    }
+
+    fouc.import_annotations(dataset, task_ids=[task_id], data_path=data_path)
+
+.. note::
+
+    If you are a :ref:`FiftyOne Enterprise <fiftyone-enterprise>` user whose
+    datasets are cloud-backed, see
+    :ref:`this section <enterprise-annotating-cloud-media>` instead.
 
 .. _cvat-occlusion-widget:
 

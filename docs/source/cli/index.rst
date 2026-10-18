@@ -1900,7 +1900,7 @@ FiftyOne utilities.
 .. code-block:: text
 
     fiftyone utils [-h] [--all-help]
-                   {compute-metadata,transform-images,transform-videos} ...
+                   {compute-metadata,sync-s3-media,transform-images,transform-videos} ...
 
 **Arguments**
 
@@ -1911,8 +1911,9 @@ FiftyOne utilities.
       --all-help            show help recursively and exit
 
     available commands:
-      {compute-metadata,transform-images,transform-videos}
+      {compute-metadata,sync-s3-media,transform-images,transform-videos}
         compute-metadata    Populates the `metadata` field of all samples in the dataset.
+        sync-s3-media       Syncs a dataset with S3-hosted media via a local cache.
         transform-images    Transforms the images in a dataset per the specified parameters.
         transform-videos    Transforms the videos in a dataset per the specified parameters.
 
@@ -1953,6 +1954,110 @@ Populates the `metadata` field of all samples in the dataset.
 
     # (Re)-populate the `metadata` field for all samples
     fiftyone utils compute-metadata <dataset-name> --overwrite
+
+.. _cli-fiftyone-utils-sync-s3-media:
+
+Sync S3 media
+~~~~~~~~~~~~~
+
+Syncs a dataset with S3-hosted media via a local cache.
+
+S3 objects are downloaded to a local cache that mirrors their bucket/key
+structure, each sample's `filepath` is set to its cached path, and its S3
+URI, which remains the source of truth for the media, is stored in a
+separate field.
+
+Samples of an existing dataset whose S3 URI field is empty are backfilled
+from their current filepath, so this command also migrates existing
+datasets. Existing S3 URI values are never modified, and objects that a
+sample already references are never added again.
+
+AWS credentials, region, and endpoint are resolved by boto3's standard
+configuration chain (`AWS_PROFILE`, `AWS_REGION`, `~/.aws/`, etc) unless
+provided. The cache directory defaults to `fiftyone.config.s3_cache_dir`,
+which can be set via the `FIFTYONE_S3_CACHE_DIR` environment variable.
+
+.. code-block:: text
+
+    fiftyone utils sync-s3-media [-h] [--uris S3_URI [S3_URI ...]]
+                                 [--uris-file PATH] [--prefix S3_PREFIX]
+                                 [--extensions EXT [EXT ...]]
+                                 [--uri-field FIELD] [--cache-dir DIR]
+                                 [--validate {size,etag}]
+                                 [--local-root DIR] [--s3-root S3_PREFIX]
+                                 [--profile PROFILE] [--region REGION]
+                                 [--endpoint-url URL] [-n NUM_WORKERS]
+                                 [--max-attempts MAX_ATTEMPTS] [-s]
+                                 [--no-metadata] [--dry-run]
+                                 DATASET_NAME
+
+**Arguments**
+
+.. code-block:: text
+
+    positional arguments:
+      DATASET_NAME          the name of the dataset
+
+    optional arguments:
+      -h, --help            show this help message and exit
+      --uris S3_URI [S3_URI ...]
+                            S3 URIs of objects to add to the dataset
+      --uris-file PATH      a file of S3 URIs of objects to add, one per line
+      --prefix S3_PREFIX    an S3 prefix whose objects to add to the dataset
+      --extensions EXT [EXT ...]
+                            file extensions of the objects to add from
+                            `--prefix`. By default, only images are added
+      --uri-field FIELD     the sample field in which to store the S3 URIs
+      --cache-dir DIR       the cache directory. By default,
+                            `fiftyone.config.s3_cache_dir` is used
+      --validate {size,etag}
+                            re-download cached files whose size or ETag
+                            differs from the S3 object's
+      --local-root DIR      a local directory whose contents mirror
+                            `--s3-root`, used to backfill the S3 URIs of
+                            samples whose media are local copies
+      --s3-root S3_PREFIX   the S3 prefix that corresponds to `--local-root`
+      --profile PROFILE     an AWS profile to use
+      --region REGION       an AWS region to use
+      --endpoint-url URL    an S3 endpoint URL to use, e.g. for MinIO
+      -n NUM_WORKERS, --num-workers NUM_WORKERS
+                            a suggested number of threads to use
+      --max-attempts MAX_ATTEMPTS
+                            the maximum number of attempts per object when
+                            transient errors occur
+      -s, --skip-failures   whether to gracefully continue without raising an
+                            error if an object cannot be downloaded
+      --no-metadata         whether to skip computing metadata
+      --dry-run             only report what would be done, without making
+                            changes
+
+**Examples**
+
+.. code-block:: shell
+
+    # Create or extend a dataset with the images under an S3 prefix
+    fiftyone utils sync-s3-media <dataset-name> \
+        --prefix s3://<bucket>/<prefix>/
+
+.. code-block:: shell
+
+    # Add the S3 objects listed in a file, one URI per line
+    fiftyone utils sync-s3-media <dataset-name> --uris-file <path>
+
+.. code-block:: shell
+
+    # Populate the cache of an existing dataset, re-downloading any
+    # cached files whose size or ETag no longer matches S3
+    fiftyone utils sync-s3-media <dataset-name> --validate etag
+
+.. code-block:: shell
+
+    # Preview the migration of a dataset whose filepaths are local
+    # copies of S3 objects, then run it
+    fiftyone utils sync-s3-media <dataset-name> \
+        --local-root <dir> --s3-root s3://<bucket>/<prefix> --dry-run
+    fiftyone utils sync-s3-media <dataset-name> \
+        --local-root <dir> --s3-root s3://<bucket>/<prefix>
 
 .. _cli-fiftyone-utils-transform-images:
 

@@ -8,6 +8,7 @@ Utilities for working with datasets in
 """
 
 from collections import defaultdict
+import contextlib
 from copy import copy, deepcopy
 from datetime import datetime
 import itertools
@@ -18,6 +19,7 @@ import os
 from packaging.version import Version
 import re
 import time
+from urllib.parse import parse_qsl
 import warnings
 import webbrowser
 
@@ -3159,8 +3161,8 @@ class CVATBackendConfig(foua.AnnotationBackendConfig):
             uploading copies of it. When provided, ``media_field`` must
             contain cloud object URIs like ``s3://bucket/path/to/image.jpg``
             in the bucket of the cloud storage, and annotations are mapped to
-            samples by the object keys of their frames. Only image and video
-            datasets are supported
+            samples by the object keys of their frames. Only image
+            collections are supported, and CVAT 2.4.5 or later is required
     """
 
     def __init__(
@@ -3218,7 +3220,9 @@ class CVATBackendConfig(foua.AnnotationBackendConfig):
         self.frame_stop = _validate_frame_arg(frame_stop, "frame_stop")
         self.frame_step = _validate_frame_arg(frame_step, "frame_step")
         self.coerce_text_attrs = coerce_text_attrs
-        self.cloud_storage_id = cloud_storage_id
+        self.cloud_storage_id = (
+            int(cloud_storage_id) if cloud_storage_id is not None else None
+        )
 
         # store privately so these aren't serialized
         self._username = username
@@ -4445,6 +4449,22 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
 
         return files, open_files
 
+    @contextlib.contextmanager
+    def _delete_tasks_on_error(self, task_ids, project_ids, enabled=True):
+        # When an upload fails, no results are saved, so the tasks and
+        # projects that were already created would be orphaned
+        try:
+            yield
+        except Exception:
+            if enabled:
+                try:
+                    self.delete_tasks(task_ids)
+                    self.delete_projects(project_ids)
+                except Exception as e:
+                    logger.warning("Failed to delete CVAT tasks: %s", e)
+
+            raise
+
     def _raise_if_task_data_failed(self, task_id, rq_id):
         urls = []
         if rq_id is not None:
@@ -4473,10 +4493,17 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
             return
 
     def _validate_cloud_storage_media(self, samples, config):
-        if samples.media_type not in (fom.IMAGE, fom.VIDEO):
+        if self._server_version < Version("2.4.5"):
+            raise ValueError(
+                "Reading media from a CVAT cloud storage requires CVAT 2.4.5 "
+                "or later, but the server is version %s" % self._server_version
+            )
+
+        if samples.media_type != fom.IMAGE:
             raise ValueError(
                 "Reading media from a CVAT cloud storage is only supported "
-                "for image and video collections, but found media type '%s'"
+                "for image collections, but found media type '%s'. Pass "
+                "`cloud_storage_id=None` to upload the media instead"
                 % samples.media_type
             )
 
@@ -4492,7 +4519,16 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
                     "When `cloud_storage_id` is provided, the '%s' field must "
                     "contain cloud object URIs like 's3://bucket/key', so "
                     "provide the `media_field` that contains them, e.g. "
-                    "`media_field='s3_uri'`. %s" % (media_field, e)
+                    "`media_field='s3_uri'`, or pass `cloud_storage_id=None` "
+                    "to upload the media instead. %s" % (media_field, e)
+                )
+
+            # CVAT rejects or rewrites such keys
+            if any(p in ("", ".", "..") for p in key.split("/")):
+                raise ValueError(
+                    "CVAT cannot read object '%s' from a cloud storage, "
+                    "because its key has empty, '.' or '..' path segments"
+                    % path
                 )
 
             if key in keys:
@@ -4507,14 +4543,14 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
 
         cloud_storage_id = config.cloud_storage_id
         try:
-            storage = self.get(self.cloud_storage_url(cloud_storage_id))
-            resource = storage.json().get("resource", None)
+            storage = self.get(self.cloud_storage_url(cloud_storage_id)).json()
         except Exception as e:
             raise ValueError(
                 "Failed to load CVAT cloud storage %s: %s"
                 % (cloud_storage_id, e)
             )
 
+        resource = storage.get("resource", None)
         if resource is not None and buckets - {resource}:
             raise ValueError(
                 "CVAT cloud storage %s reads from bucket '%s', but the '%s' "
@@ -4527,53 +4563,75 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
                 )
             )
 
+        # CVAT 2.9.0 and later silently ignore objects outside of the
+        # storage's prefix
+        attrs = dict(parse_qsl(storage.get("specific_attributes", None) or ""))
+        prefix = attrs.get("prefix", None)
+        if prefix and self._server_version >= Version("2.9.0"):
+            outside = sorted(k for k in keys if not k.startswith(prefix))
+            if outside:
+                raise ValueError(
+                    "CVAT cloud storage %s only provides objects whose keys "
+                    "start with '%s', but %d objects do not, e.g. '%s'"
+                    % (cloud_storage_id, prefix, len(outside), outside[0])
+                )
+
         if not config.use_cache:
             logger.warning(
-                "CVAT requires `use_cache=True` when reading media from a "
-                "cloud storage, so it will be used"
+                "CVAT reads images from cloud storages via its cache, so "
+                "`use_cache=True` will be used"
             )
 
     def _build_cloud_frame_id_map(self, task_id, samples, media_field):
         # The frames of tasks that read from a cloud storage are named by
         # their object keys, so we use the names to map frames to samples
         # rather than relying on the order in which CVAT stored them
-        sample_ids, paths = samples.values(["id", media_field])
-        key_map = {
-            _parse_cloud_uri(path)[1]: sample_id
-            for path, sample_id in zip(paths, sample_ids)
-        }
+        sample_ids, paths, widths, heights = samples.values(
+            ["id", media_field, "metadata.width", "metadata.height"]
+        )
+
+        key_map = {}
+        for sample_id, path, width, height in zip(
+            sample_ids, paths, widths, heights
+        ):
+            key = _parse_cloud_uri(path)[1]
+            key_map[key] = (sample_id, width, height)
 
         frames = self.get(self.task_data_meta_url(task_id)).json()["frames"]
 
         frame_id_map = {}
-        matched_keys = set()
         error = None
         for frame_id, frame in enumerate(frames):
             name = frame.get("name", None)
-            key = _match_cloud_key(name, key_map)
-            if key is None or key in matched_keys:
+            if name not in key_map:
                 error = "frame %d ('%s') matches no object" % (frame_id, name)
                 break
 
-            matched_keys.add(key)
-            frame_id_map[frame_id] = {
-                "sample_id": key_map[key],
-                "name": name,
-            }
+            sample_id, width, height = key_map.pop(name)
 
-        if error is None and len(matched_keys) < len(key_map):
-            missing = sorted(set(key_map.keys()) - matched_keys)
+            # Existing labels are converted to pixels via the sample's
+            # metadata, so it must describe the same image that CVAT shows
+            size = (frame.get("width", None), frame.get("height", None))
+            if size != (width, height):
+                error = (
+                    "object '%s' is %sx%s in CVAT but %sx%s in the sample's "
+                    "metadata, so the local copy may be stale"
+                    % (name, size[0], size[1], width, height)
+                )
+                break
+
+            frame_id_map[frame_id] = {"sample_id": sample_id, "name": name}
+
+        if error is None and key_map:
             error = "%d object(s) are missing, e.g. '%s'" % (
-                len(missing),
-                missing[0],
+                len(key_map),
+                next(iter(key_map)),
             )
 
         if error is not None:
-            self.delete_task(task_id)
             raise ValueError(
-                "Failed to map the frames of CVAT task %d to samples, so the "
-                "task was deleted: %s. Check that all objects exist in the "
-                "cloud storage" % (task_id, error)
+                "Failed to map the frames of CVAT task %d to samples: %s"
+                % (task_id, error)
             )
 
         return frame_id_map
@@ -4701,15 +4759,41 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
             config.label_schema = label_schema
             save_config = True
 
-        if config.cloud_storage_id is not None:
+        cloud_storage_id = config.cloud_storage_id
+        if cloud_storage_id is not None:
             self._validate_cloud_storage_media(samples, config)
 
         samples.compute_metadata()
 
+        if cloud_storage_id is not None:
+            num_missing = len(samples.exists("metadata", False))
+            if num_missing > 0:
+                raise ValueError(
+                    "Failed to compute the metadata of %d sample(s), which "
+                    "requires local copies of their media. Sync them via "
+                    "`fiftyone utils sync-s3-media` or "
+                    ":func:`fiftyone.utils.aws.sync_s3_samples` first"
+                    % num_missing
+                )
+
         num_samples = len(samples)
         batch_size = self._get_batch_size(
-            samples, task_size, upload_media=config.cloud_storage_id is None
+            samples, task_size, upload_media=cloud_storage_id is None
         )
+
+        # CVAT 2.4.5-2.4.6 accept at most 500 cloud storage files per task
+        if (
+            cloud_storage_id is not None
+            and self._server_version < Version("2.4.7")
+            and batch_size > 500
+        ):
+            logger.warning(
+                "CVAT %s accepts at most 500 cloud storage files per task, so "
+                "multiple tasks will be created",
+                self._server_version,
+            )
+            batch_size = 500
+
         num_batches = math.ceil(num_samples / batch_size)
         is_video = samples.media_type == fom.VIDEO
         is_clips = samples._is_clips
@@ -4725,7 +4809,12 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
         if num_samples <= batch_size:
             pb_kwargs["quiet"] = True
 
-        with fou.ProgressBar(**pb_kwargs) as pb:
+        with (
+            fou.ProgressBar(**pb_kwargs) as pb,
+            self._delete_tasks_on_error(
+                task_ids, project_ids, enabled=cloud_storage_id is not None
+            ),
+        ):
             for idx, offset in enumerate(range(0, num_samples, batch_size)):
                 samples_batch = samples[offset : (offset + batch_size)]
                 anno_tags = []
@@ -4845,7 +4934,7 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
                 for label_field in label_schema.keys():
                     labels_task_map[label_field].append(task_id)
 
-                if config.cloud_storage_id is not None and not is_video:
+                if cloud_storage_id is not None:
                     self._remap_cloud_frames(
                         anno_shapes,
                         anno_tags,
@@ -5774,7 +5863,7 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
             task_id, samples_batch, frame_start, frame_stop, frame_step
         )
 
-        if cloud_storage_id is not None and not is_video:
+        if cloud_storage_id is not None:
             frame_id_map[task_id] = self._build_cloud_frame_id_map(
                 task_id, samples_batch, media_field
             )
@@ -8569,21 +8658,6 @@ def _parse_cloud_uri(uri):
         )
 
     return bucket, key
-
-
-def _match_cloud_key(name, key_map):
-    if not name:
-        return None
-
-    if name in key_map:
-        return name
-
-    # Tolerate frame names that are relative to, or prefixed by, a path
-    candidates = [
-        k for k in key_map if k.endswith("/" + name) or name.endswith("/" + k)
-    ]
-
-    return candidates[0] if len(candidates) == 1 else None
 
 
 def _parse_frame_step(data_resp):

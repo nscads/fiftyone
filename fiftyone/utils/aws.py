@@ -11,7 +11,9 @@ import logging
 import multiprocessing.dummy
 import os
 import re
+import tempfile
 import time
+import unicodedata
 from urllib.parse import urlparse
 
 import boto3
@@ -43,8 +45,12 @@ _RETRYABLE_ERRORS = (
     botocore.exceptions.ConnectionError,
     botocore.exceptions.HTTPClientError,
     botocore.exceptions.IncompleteReadError,
+    boto3.exceptions.RetriesExceededError,
     s3transfer.exceptions.RetriesExceededError,
 )
+
+# ETags that are MD5 digests, of the object or (multipart) of its parts' MD5s
+_MD5_ETAG_PATT = re.compile(r"^[0-9a-f]{32}(-[0-9]+)?$")
 
 # ETags of objects encrypted with these methods are not MD5 digests
 _NON_MD5_ETAG_ENCRYPTIONS = ("aws:kms", "aws:kms:dsse")
@@ -358,8 +364,9 @@ def add_s3_samples(
     stores the object's S3 URI, which remains the source of truth for the
     media.
 
-    Objects whose URI is already stored in ``uri_field`` of a sample in the
-    dataset are skipped, so this method can be called repeatedly to add new
+    Objects that a sample in the dataset already references, via its
+    ``uri_field`` or a filepath from which :func:`sync_s3_samples` can infer
+    the URI, are skipped, so this method can be called repeatedly to add new
     objects.
 
     Args:
@@ -398,12 +405,19 @@ def add_s3_samples(
             max_pool_connections=fou.recommend_thread_pool_workers(num_workers)
         )
 
+    if dataset.media_type == fom.GROUP:
+        raise ValueError(
+            "Adding S3 samples to grouped datasets is not supported"
+        )
+
     if etau.is_str(s3_uris):
         s3_uris = list_s3_uris(s3_uris, extensions=extensions, client=client)
 
     _ensure_uri_field(dataset, uri_field)
 
-    seen = set(dataset.distinct(uri_field))
+    # Objects that existing samples reference via their filepaths count as
+    # existing too, even if their URIs have not been backfilled yet
+    seen = _get_known_s3_uris(dataset, uri_field, cache_dir)
     new_uris = []
     for s3_uri in s3_uris:
         if s3_uri not in seen:
@@ -477,8 +491,11 @@ def sync_s3_samples(
         under ``s3_root``
     -   a path in the cache directory
 
-    Existing ``uri_field`` values are never modified. Samples whose URI cannot
+    Inferred URIs are only recorded once their objects have been cached, and
+    existing ``uri_field`` values are never modified. Samples whose URI cannot
     be determined are left unchanged and reported.
+
+    Grouped collections are synced across all of their slices.
 
     Args:
         sample_collection: a
@@ -495,7 +512,8 @@ def sync_s3_samples(
         validate (None): how to validate files that are already cached. See
             :func:`cache_s3_files` for the supported values
         compute_metadata (True): whether to compute the metadata of samples
-            whose media changed or that have no metadata
+            whose media changed or that have no metadata. Metadata that no
+            longer describes a sample's media is cleared either way
         dry_run (False): whether to only report what would be done, without
             downloading media or modifying any samples
         num_workers (None): a suggested number of threads to use
@@ -514,8 +532,8 @@ def sync_s3_samples(
         a dict containing the following counts:
 
         -   ``num_samples``: the number of samples in the collection
-        -   ``num_backfilled``: the number of samples whose URI was inferred
-            from their filepath
+        -   ``num_backfilled``: the number of samples whose URI was (or, when
+            ``dry_run`` is True, would be) inferred from their filepath
         -   ``num_unresolved``: the number of samples whose URI could not be
             determined
         -   ``num_downloaded``: the number of objects that were downloaded
@@ -524,43 +542,46 @@ def sync_s3_samples(
         -   ``num_updated``: the number of samples whose ``filepath`` was
             (or, when ``dry_run`` is True, would be) updated
     """
-    if (s3_root is None) != (local_root is None):
-        raise ValueError(
-            "`s3_root` and `local_root` must be provided together"
-        )
-
-    if s3_root is not None:
-        _split_s3_uri(s3_root)
-        local_root = fos.normalize_path(local_root)
-
+    local_root = _parse_roots(s3_root, local_root)
     cache_dir = _parse_cache_dir(cache_dir)
     dataset = sample_collection._dataset
+
+    # Updates are applied by ID to the dataset, because they may change
+    # whether samples match the given collection
+    if dataset.media_type == fom.GROUP:
+        sample_collection = sample_collection.select_group_slices(
+            _allow_mixed=True
+        )
+        base = dataset.select_group_slices(_allow_mixed=True)
+    else:
+        base = dataset
 
     if not dry_run:
         _ensure_uri_field(dataset, uri_field)
 
-    if sample_collection.has_field(uri_field):
-        sample_ids, filepaths, s3_uris = sample_collection.values(
-            ["id", "filepath", uri_field]
-        )
-    else:
-        sample_ids, filepaths = sample_collection.values(["id", "filepath"])
-        s3_uris = [None] * len(sample_ids)
+    sample_ids, filepaths, s3_uris, sizes = _get_s3_values(
+        sample_collection, uri_field
+    )
 
     backfill = {}
     unresolved = []
+    num_mangled = 0
     for idx, (sample_id, filepath, s3_uri) in enumerate(
         zip(sample_ids, filepaths, s3_uris)
     ):
         if s3_uri:
             continue
 
-        s3_uri = _infer_s3_uri(filepath, cache_dir, local_root, s3_root)
+        s3_uri, mangled = _infer_s3_uri(
+            filepath, cache_dir, local_root, s3_root
+        )
+        s3_uris[idx] = s3_uri
+
         if s3_uri is None:
             unresolved.append(filepath)
         else:
             backfill[sample_id] = s3_uri
-            s3_uris[idx] = s3_uri
+            num_mangled += mangled
 
     if unresolved:
         logger.warning(
@@ -571,10 +592,19 @@ def sync_s3_samples(
             unresolved[0],
         )
 
+    if num_mangled:
+        logger.warning(
+            "Inferred the S3 URIs of %d sample(s) from filepaths that were "
+            "created by passing S3 URIs as sample filepaths. Keys with empty, "
+            "'.' or '..' segments like 'a//b.jpg' cannot be recovered from "
+            "such filepaths, so please verify these URIs",
+            num_mangled,
+        )
+
     sync = [
-        (_id, f, u)
-        for _id, f, u in zip(sample_ids, filepaths, s3_uris)
-        if u is not None
+        (_id, f, u, b)
+        for _id, f, u, b in zip(sample_ids, filepaths, s3_uris, sizes)
+        if u
     ]
 
     summary = {
@@ -587,7 +617,7 @@ def sync_s3_samples(
     }
 
     if dry_run:
-        for _, filepath, s3_uri in sync:
+        for _, filepath, s3_uri, _ in sync:
             try:
                 if get_s3_cache_path(s3_uri, cache_dir=cache_dir) != filepath:
                     summary["num_updated"] += 1
@@ -596,15 +626,12 @@ def sync_s3_samples(
 
         return summary
 
-    if backfill:
-        # The source URIs are recorded first so that they are never lost,
-        # even if downloading fails
-        sample_collection.set_values(uri_field, backfill, key_field="id")
+    summary["num_backfilled"] = 0
 
     if not sync:
         return summary
 
-    sync_ids, sync_filepaths, sync_uris = zip(*sync)
+    sync_ids, sync_filepaths, sync_uris, sync_sizes = zip(*sync)
 
     paths, downloaded = _cache_s3_files(
         sync_uris,
@@ -617,35 +644,53 @@ def sync_s3_samples(
         client=client,
     )
 
+    new_uris = {}
     new_filepaths = {}
     synced_ids = []
-    refresh_ids = []
-    for sample_id, filepath, path in zip(sync_ids, sync_filepaths, paths):
+    stale_ids = []
+    for sample_id, filepath, path, size in zip(
+        sync_ids, sync_filepaths, paths, sync_sizes
+    ):
         if path is None:
             continue
 
         synced_ids.append(sample_id)
 
+        if sample_id in backfill:
+            new_uris[sample_id] = backfill[sample_id]
+
         if path != filepath:
             new_filepaths[sample_id] = path
 
-        if path != filepath or path in downloaded:
-            refresh_ids.append(sample_id)
+        if (
+            path != filepath
+            or path in downloaded
+            or (size is not None and size != os.path.getsize(path))
+        ):
+            stale_ids.append(sample_id)
+
+    # Inferred URIs are only recorded once their objects have been cached, so
+    # that wrong inferences are never persisted. The filepaths of samples that
+    # failed are unchanged, so a later run can infer their URIs again
+    if new_uris:
+        base.set_values(uri_field, new_uris, key_field="id")
+
+    # Metadata that may describe other media is cleared before the filepaths
+    # change, so that it is recomputed even if this run is interrupted
+    if stale_ids:
+        base.set_values(
+            "metadata", {_id: None for _id in stale_ids}, key_field="id"
+        )
 
     if new_filepaths:
-        sample_collection.set_values("filepath", new_filepaths, key_field="id")
+        base.set_values("filepath", new_filepaths, key_field="id")
 
-    if compute_metadata:
-        if refresh_ids:
-            dataset.select(refresh_ids).compute_metadata(
-                overwrite=True, num_workers=num_workers, progress=progress
-            )
+    if compute_metadata and synced_ids:
+        base.select(synced_ids).compute_metadata(
+            num_workers=num_workers, progress=progress
+        )
 
-        if synced_ids:
-            dataset.select(synced_ids).compute_metadata(
-                num_workers=num_workers, progress=progress
-            )
-
+    summary["num_backfilled"] = len(new_uris)
     summary["num_downloaded"] = len(downloaded)
     summary["num_failed"] = len(sync_ids) - len(synced_ids)
     summary["num_updated"] = len(new_filepaths)
@@ -716,6 +761,57 @@ def _parse_cache_dir(cache_dir):
     return fos.normalize_path(cache_dir)
 
 
+def _parse_roots(s3_root, local_root):
+    if (s3_root is None) != (local_root is None):
+        raise ValueError(
+            "`s3_root` and `local_root` must be provided together"
+        )
+
+    if s3_root is None:
+        return None
+
+    _split_s3_uri(s3_root)
+    return fos.normalize_path(local_root)
+
+
+def _get_s3_values(sample_collection, uri_field):
+    if sample_collection.has_field(uri_field):
+        sample_ids, filepaths, s3_uris, sizes = sample_collection.values(
+            ["id", "filepath", uri_field, "metadata.size_bytes"]
+        )
+    else:
+        sample_ids, filepaths, sizes = sample_collection.values(
+            ["id", "filepath", "metadata.size_bytes"]
+        )
+        s3_uris = [None] * len(sample_ids)
+
+    return sample_ids, filepaths, s3_uris, sizes
+
+
+def _get_known_s3_uris(
+    sample_collection, uri_field, cache_dir, local_root=None, s3_root=None
+):
+    local_root = _parse_roots(s3_root, local_root)
+    cache_dir = _parse_cache_dir(cache_dir)
+
+    if sample_collection.media_type == fom.GROUP:
+        sample_collection = sample_collection.select_group_slices(
+            _allow_mixed=True
+        )
+
+    _, filepaths, s3_uris, _ = _get_s3_values(sample_collection, uri_field)
+
+    known = set()
+    for filepath, s3_uri in zip(filepaths, s3_uris):
+        if not s3_uri:
+            s3_uri, _ = _infer_s3_uri(filepath, cache_dir, local_root, s3_root)
+
+        if s3_uri:
+            known.add(s3_uri)
+
+    return known
+
+
 def _ensure_uri_field(dataset, uri_field):
     if not dataset.has_sample_field(uri_field):
         dataset.add_sample_field(
@@ -726,10 +822,15 @@ def _ensure_uri_field(dataset, uri_field):
 
 
 def _infer_s3_uri(filepath, cache_dir, local_root, s3_root):
+    """Returns an ``(s3_uri, mangled)`` tuple, where ``mangled`` is whether
+    the URI was recovered from a mangled S3 URI, which may have lost empty,
+    ``.`` or ``..`` key segments.
+    """
     if not filepath:
-        return None
+        return None, False
 
     s3_uri = None
+    mangled = False
 
     if is_s3_uri(filepath):
         s3_uri = filepath
@@ -737,26 +838,32 @@ def _infer_s3_uri(filepath, cache_dir, local_root, s3_root):
         match = _MANGLED_S3_URI_PATT.search(filepath)
         if match:
             s3_uri = _S3_PREFIX + match.group(1).replace(os.sep, "/")
-
-    if s3_uri is None and local_root is not None:
-        relpath = _get_relpath(filepath, local_root)
-        if relpath is not None:
-            s3_uri = s3_root.rstrip("/") + "/" + relpath
+            mangled = True
 
     if s3_uri is None:
-        relpath = _get_relpath(filepath, cache_dir)
-        if relpath is not None:
-            s3_uri = _S3_PREFIX + relpath
+        roots = []
+        if local_root is not None:
+            roots.append((local_root, s3_root.rstrip("/") + "/"))
+
+        roots.append((cache_dir, _S3_PREFIX))
+
+        # The most specific root wins, e.g. when the cache directory is inside
+        # `local_root`
+        for root, prefix in sorted(roots, key=lambda r: -len(r[0])):
+            relpath = _get_relpath(filepath, root)
+            if relpath is not None:
+                s3_uri = prefix + relpath
+                break
 
     if s3_uri is None:
-        return None
+        return None, False
 
     try:
         parse_s3_uri(s3_uri)
     except ValueError:
-        return None
+        return None, False
 
-    return s3_uri
+    return s3_uri, mangled
 
 
 def _get_relpath(path, root):
@@ -796,11 +903,27 @@ def _cache_s3_files(
     s3_uris = list(s3_uris)
     cache_dir = _parse_cache_dir(cache_dir)
 
+    # Distinct keys like 'a.jpg' and 'A.jpg' would share one cached file
+    case_insensitive = bool(s3_uris) and _is_case_insensitive(cache_dir)
+
     paths = []
     tasks = {}
+    folded = {}
     for s3_uri in s3_uris:
         try:
             path = get_s3_cache_path(s3_uri, cache_dir=cache_dir)
+
+            if case_insensitive:
+                folded_path = unicodedata.normalize("NFC", path).casefold()
+            else:
+                folded_path = path
+
+            other = folded.setdefault(folded_path, s3_uri)
+            if other != s3_uri:
+                raise ValueError(
+                    "S3 URIs '%s' and '%s' map to the same file on this "
+                    "case-insensitive filesystem" % (other, s3_uri)
+                )
         except ValueError as e:
             if not skip_failures:
                 raise
@@ -904,45 +1027,86 @@ def _is_cached_file_valid(client, bucket, key, path, validate, max_attempts):
 
     etag = head.get("ETag", "").strip('"').lower()
 
+    # Objects whose ETags are not MD5-based can only be validated by size
     if (
-        not etag
+        not _MD5_ETAG_PATT.match(etag)
         or head.get("ServerSideEncryption") in _NON_MD5_ETAG_ENCRYPTIONS
         or head.get("SSECustomerAlgorithm")
+        or bucket.endswith("--x-s3")  # S3 Express directory buckets
     ):
         return True
 
     if "-" not in etag:
-        return _compute_etag(path) == etag
+        return _compute_md5(path) == etag
 
-    # Multipart ETags are the MD5 of the concatenated MD5s of each part
-    num_parts = etag.rsplit("-", 1)[1]
-    if not num_parts.isdigit():
-        return True
+    # Multipart ETags are the MD5 of the concatenated MD5s of each part.
+    # Parts usually have the same size except the last, so try that first
+    num_parts = int(etag.split("-")[1])
+    size = head["ContentLength"]
 
-    part = _retry(
-        lambda: client.head_object(Bucket=bucket, Key=key, PartNumber=1),
-        max_attempts,
+    def get_part_size(number):
+        head = _retry(
+            lambda: client.head_object(
+                Bucket=bucket, Key=key, PartNumber=number
+            ),
+            max_attempts,
+        )
+        return head["ContentLength"]
+
+    part_size = get_part_size(1)
+    last_size = size - part_size * (num_parts - 1)
+    if 0 < last_size <= part_size:
+        part_sizes = [part_size] * (num_parts - 1) + [last_size]
+        if _compute_multipart_etag(path, part_sizes) == etag:
+            return True
+
+    part_sizes = [part_size]
+    part_sizes.extend(get_part_size(n) for n in range(2, num_parts + 1))
+
+    return (
+        sum(part_sizes) == size
+        and _compute_multipart_etag(path, part_sizes) == etag
     )
 
-    return _compute_etag(path, part_size=part["ContentLength"]) == etag
+
+def _compute_md5(path):
+    md5 = hashlib.md5()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(_HASH_CHUNK_SIZE), b""):
+            md5.update(chunk)
+
+    return md5.hexdigest()
 
 
-def _compute_etag(path, part_size=None):
-    if part_size is None:
-        md5 = hashlib.md5()
-        with open(path, "rb") as f:
-            for chunk in iter(lambda: f.read(_HASH_CHUNK_SIZE), b""):
-                md5.update(chunk)
-
-        return md5.hexdigest()
-
+def _compute_multipart_etag(path, part_sizes):
     digests = []
     with open(path, "rb") as f:
-        for part in iter(lambda: f.read(part_size), b""):
-            digests.append(hashlib.md5(part).digest())
+        for part_size in part_sizes:
+            md5 = hashlib.md5()
+            while part_size > 0:
+                chunk = f.read(min(part_size, _HASH_CHUNK_SIZE))
+                if not chunk:
+                    break
+
+                md5.update(chunk)
+                part_size -= len(chunk)
+
+            digests.append(md5.digest())
 
     md5 = hashlib.md5(b"".join(digests))
     return "%s-%d" % (md5.hexdigest(), len(digests))
+
+
+def _is_case_insensitive(dirpath):
+    fos.ensure_dir(dirpath)
+    fd, path = tempfile.mkstemp(prefix="case_probe_", dir=dirpath)
+    os.close(fd)
+
+    try:
+        upper = os.path.join(dirpath, os.path.basename(path).upper())
+        return os.path.exists(upper)
+    finally:
+        os.remove(path)
 
 
 def _retry(fcn, max_attempts):
