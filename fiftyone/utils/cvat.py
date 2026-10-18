@@ -4615,7 +4615,10 @@ class CVATAnnotationAPI(foua.AnnotationAPI):
             if size != (width, height):
                 error = (
                     "object '%s' is %sx%s in CVAT but %sx%s in the sample's "
-                    "metadata, so the local copy may be stale"
+                    "metadata, so the local copy may be stale. Re-sync it via "
+                    "`fiftyone utils sync-s3-media <dataset> --validate etag`, "
+                    "or, if it is current, recompute its metadata via "
+                    "`compute_metadata(overwrite=True)`"
                     % (name, size[0], size[1], width, height)
                 )
                 break

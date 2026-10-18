@@ -1347,6 +1347,7 @@ class CVATCloudStorageTests(unittest.TestCase):
 
         self.assertIn("images/bravo.jpg", str(cm.exception))
         self.assertIn("stale", str(cm.exception))
+        self.assertIn("--validate etag", str(cm.exception))
         self.assertEqual(self.server.tasks, {})
         self.assertEqual(
             self.server.get_calls("PUT", r"/api/tasks/\d+/annotations"), []

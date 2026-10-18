@@ -57,6 +57,9 @@ _NON_MD5_ETAG_ENCRYPTIONS = ("aws:kms", "aws:kms:dsse")
 
 _HASH_CHUNK_SIZE = 8 * 1024**2
 
+# The number of sample IDs per query, well within MongoDB's document size limit
+_SAMPLE_BATCH_SIZE = 100000
+
 
 def download_public_s3_files(
     urls, download_dir=None, num_workers=None, overwrite=True
@@ -448,10 +451,8 @@ def add_s3_samples(
 
     sample_ids = dataset.add_samples(samples, progress=progress)
 
-    if compute_metadata and sample_ids:
-        dataset.select(sample_ids).compute_metadata(
-            num_workers=num_workers, progress=progress
-        )
+    if compute_metadata:
+        _compute_metadata(dataset, sample_ids, num_workers, progress)
 
     return sample_ids
 
@@ -542,16 +543,24 @@ def sync_s3_samples(
         -   ``num_updated``: the number of samples whose ``filepath`` was
             (or, when ``dry_run`` is True, would be) updated
     """
+    if sample_collection._is_generated:
+        raise ValueError(
+            "Patches, frames and clips views cannot be synced; sync their "
+            "source collection instead"
+        )
+
     local_root = _parse_roots(s3_root, local_root)
     cache_dir = _parse_cache_dir(cache_dir)
     dataset = sample_collection._dataset
 
-    # Updates are applied by ID to the dataset, because they may change
-    # whether samples match the given collection
-    if dataset.media_type == fom.GROUP:
+    if sample_collection.media_type == fom.GROUP:
         sample_collection = sample_collection.select_group_slices(
             _allow_mixed=True
         )
+
+    # Updates are applied by ID to the dataset, because they may change
+    # whether samples match the given collection
+    if dataset.media_type == fom.GROUP:
         base = dataset.select_group_slices(_allow_mixed=True)
     else:
         base = dataset
@@ -685,10 +694,15 @@ def sync_s3_samples(
     if new_filepaths:
         base.set_values("filepath", new_filepaths, key_field="id")
 
-    if compute_metadata and synced_ids:
-        base.select(synced_ids).compute_metadata(
-            num_workers=num_workers, progress=progress
-        )
+    if compute_metadata:
+        # Only samples whose metadata was cleared or is missing need it
+        stale = set(stale_ids)
+        metadata_ids = [
+            _id
+            for _id, path, size in zip(sync_ids, paths, sync_sizes)
+            if path is not None and (_id in stale or size is None)
+        ]
+        _compute_metadata(base, metadata_ids, num_workers, progress)
 
     summary["num_backfilled"] = len(new_uris)
     summary["num_downloaded"] = len(downloaded)
@@ -821,6 +835,13 @@ def _ensure_uri_field(dataset, uri_field):
         )
 
 
+def _compute_metadata(sample_collection, sample_ids, num_workers, progress):
+    for batch_ids in fou.iter_batches(sample_ids, _SAMPLE_BATCH_SIZE):
+        sample_collection.select(batch_ids).compute_metadata(
+            num_workers=num_workers, progress=progress
+        )
+
+
 def _infer_s3_uri(filepath, cache_dir, local_root, s3_root):
     """Returns an ``(s3_uri, mangled)`` tuple, where ``mangled`` is whether
     the URI was recovered from a mangled S3 URI, which may have lost empty,
@@ -914,7 +935,7 @@ def _cache_s3_files(
             path = get_s3_cache_path(s3_uri, cache_dir=cache_dir)
 
             if case_insensitive:
-                folded_path = unicodedata.normalize("NFC", path).casefold()
+                folded_path = unicodedata.normalize("NFC", path).lower()
             else:
                 folded_path = path
 
@@ -1098,15 +1119,47 @@ def _compute_multipart_etag(path, part_sizes):
 
 
 def _is_case_insensitive(dirpath):
-    fos.ensure_dir(dirpath)
-    fd, path = tempfile.mkstemp(prefix="case_probe_", dir=dirpath)
+    try:
+        fos.ensure_dir(dirpath)
+        fd, path = tempfile.mkstemp(prefix="case_probe_", dir=dirpath)
+    except OSError:
+        # The cache is not writable, so we probe its existing contents
+        return _is_case_insensitive_readonly(dirpath)
+
     os.close(fd)
 
     try:
         upper = os.path.join(dirpath, os.path.basename(path).upper())
         return os.path.exists(upper)
     finally:
-        os.remove(path)
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _is_case_insensitive_readonly(dirpath):
+    try:
+        paths = [os.path.join(dirpath, n) for n in os.listdir(dirpath)]
+    except OSError:
+        paths = []
+
+    paths.append(os.path.abspath(dirpath))
+
+    for path in paths:
+        head, name = os.path.split(path)
+        swapped = name.swapcase()
+        if swapped == name:
+            continue
+
+        other = os.path.join(head, swapped)
+        try:
+            return os.path.exists(other) and os.path.samefile(path, other)
+        except OSError:
+            continue
+
+    # We cannot tell, so we assume the common case
+    return False
 
 
 def _retry(fcn, max_attempts):

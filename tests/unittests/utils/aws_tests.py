@@ -1061,6 +1061,17 @@ class TestCacheCollisions:
         assert isinstance(result, bool)
         assert os.listdir(tmp_path / "cache") == []
 
+    def test_read_only_cache(self, monkeypatch, s3, images, cache_dir):
+        uris = list(images)
+        paths = fouaws.cache_s3_files(uris, cache_dir=cache_dir, client=s3)
+
+        def _mkstemp(*args, **kwargs):
+            raise PermissionError("Read-only file system")
+
+        # A fully cached, read-only cache is still usable
+        monkeypatch.setattr(fouaws.tempfile, "mkstemp", _mkstemp)
+        assert fouaws.cache_s3_files(uris, cache_dir=cache_dir) == paths
+
 
 class TestAddS3Samples:
     def test_add_from_prefix(self, fixture_dataset, s3, images, cache_dir):
@@ -1888,6 +1899,75 @@ class TestSyncS3SamplesEdgeCases:
         finally:
             dataset.delete()
 
+    def test_group_slice_view(self, s3, images, cache_dir):
+        uris = list(images)
+        dataset = fo.Dataset()
+        try:
+            group = fo.Group()
+            dataset.add_samples(
+                [
+                    fo.Sample(
+                        filepath="/placeholder/left.jpg",
+                        group=group.element("left"),
+                    ),
+                    fo.Sample(
+                        filepath="/placeholder/right.jpg",
+                        group=group.element("right"),
+                    ),
+                ]
+            )
+            dataset.select_group_slices(_allow_mixed=True).set_values(
+                "filepath", uris[:2]
+            )
+            left = dataset.select_group_slices("left")
+            right = dataset.select_group_slices("right")
+
+            summary = fouaws.sync_s3_samples(
+                left, cache_dir=cache_dir, progress=False, client=s3
+            )
+
+            assert summary["num_updated"] == 1
+            assert left.values("filepath") == [_cache_path(uris[0], cache_dir)]
+            assert left.values("s3_uri") == [uris[0]]
+            assert right.values("filepath") == [uris[1]]
+            assert right.values("s3_uri") == [None]
+        finally:
+            dataset.delete()
+
+    def test_generated_views_raise(
+        self, fixture_dataset, s3, images, cache_dir
+    ):
+        dataset = self._make_dataset(fixture_dataset, list(images))
+        dataset.set_values(
+            "ground_truth",
+            [
+                fo.Detections(detections=[fo.Detection(label="a")])
+                for _ in range(len(dataset))
+            ],
+        )
+
+        with pytest.raises(ValueError, match="source collection"):
+            fouaws.sync_s3_samples(
+                dataset.to_patches("ground_truth"),
+                cache_dir=cache_dir,
+                client=s3,
+            )
+
+    def test_metadata_computed_in_batches(
+        self, monkeypatch, fixture_dataset, s3, images, cache_dir
+    ):
+        monkeypatch.setattr(fouaws, "_SAMPLE_BATCH_SIZE", 2)
+        uris = list(images)
+        dataset = self._make_dataset(fixture_dataset, uris)
+
+        fouaws.sync_s3_samples(
+            dataset, cache_dir=cache_dir, progress=False, client=s3
+        )
+
+        assert dataset.values("metadata.width") == [
+            images[uri][0] for uri in uris
+        ]
+
     def test_most_specific_root_wins(
         self, fixture_dataset, s3, images, cache_dir, tmp_path
     ):
@@ -1989,6 +2069,25 @@ class TestSyncS3MediaCommandValidation:
 
         assert not fo.dataset_exists(dataset_name)
         assert not os.path.exists(os.path.join(cache_dir, BUCKET))
+
+    def test_invalid_s3_root_validated_before_changes(
+        self, monkeypatch, s3, images, cache_dir, dataset_name, tmp_path
+    ):
+        with pytest.raises(SystemExit):
+            _run_cli(
+                monkeypatch,
+                dataset_name,
+                "--prefix",
+                "s3://%s/dir/" % BUCKET,
+                "--s3-root",
+                "s3://",
+                "--local-root",
+                tmp_path,
+                "--cache-dir",
+                cache_dir,
+            )
+
+        assert not fo.dataset_exists(dataset_name)
 
 
 class TestSyncS3MediaCommand:

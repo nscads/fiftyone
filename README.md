@@ -521,9 +521,9 @@ summary = fouaws.sync_s3_samples(dataset, validate="etag")
 **Annotate in CVAT.** Pass `media_field="s3_uri"` and the ID of the CVAT cloud
 storage that points to your bucket, and CVAT reads the images from S3 rather
 than receiving uploaded copies. Frames are matched to samples by S3 object key,
-so each object may appear only once per task. This requires CVAT 2.4.5 or later
-and image datasets. If CVAT's copy of an image differs in size from the cached
-one, the task is deleted and an error asks you to re-sync with
+so each object may appear only once per annotation run. This requires CVAT
+2.4.5 or later and image datasets. If CVAT's copy of an image differs in size
+from the cached one, the task is deleted and an error asks you to re-sync with
 `--validate etag`:
 
 ```py

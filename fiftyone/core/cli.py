@@ -34,6 +34,7 @@ import fiftyone.brain.config as fobc
 import fiftyone.constants as foc
 import fiftyone.core.config as focg
 import fiftyone.core.dataset as fod
+import fiftyone.core.media as fomm
 import fiftyone.core.session as fos
 import fiftyone.core.utils as fou
 import fiftyone.migrations as fom
@@ -5156,13 +5157,10 @@ class SyncS3MediaCommand(Command):
 
     @staticmethod
     def execute(parser, args):
-        if (args.s3_root is None) != (args.local_root is None):
-            parser.error(
-                "`--s3-root` and `--local-root` must be used together"
-            )
-
-        if args.s3_root is not None and not fouaws.is_s3_uri(args.s3_root):
-            parser.error("Invalid `--s3-root` '%s'" % args.s3_root)
+        try:
+            fouaws._parse_roots(args.s3_root, args.local_root)
+        except ValueError as e:
+            parser.error(str(e))
 
         client = fouaws.get_s3_client(
             profile=args.profile,
@@ -5191,6 +5189,8 @@ class SyncS3MediaCommand(Command):
 
         if fod.dataset_exists(args.name):
             dataset = fod.load_dataset(args.name)
+            if add_uris and dataset.media_type == fomm.GROUP:
+                parser.error("Cannot add S3 samples to grouped datasets")
         elif not add_uris:
             raise ValueError(
                 "Dataset '%s' not found. Provide `--prefix`, `--uris`, or "
