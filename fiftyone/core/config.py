@@ -114,6 +114,9 @@ class FiftyOneConfig(EnvConfig):
         self.plugins_dir = self.parse_string(
             d, "plugins_dir", env_var="FIFTYONE_PLUGINS_DIR", default=None
         )
+        self.s3_cache_dir = self.parse_path(
+            d, "s3_cache_dir", env_var="FIFTYONE_S3_CACHE_DIR", default=None
+        )
         self.plugins_cache_enabled = self.parse_bool(
             d,
             "plugins_cache_enabled",
@@ -361,6 +364,11 @@ class FiftyOneConfig(EnvConfig):
             self.plugins_dir = os.path.join(
                 self.default_dataset_dir,
                 "__plugins__",
+            )
+
+        if self.s3_cache_dir is None:
+            self.s3_cache_dir = os.path.join(
+                self.default_dataset_dir, "__s3_cache__"
             )
 
         if self.default_ml_backend is None:

@@ -49,6 +49,8 @@ import fiftyone.utils.video as fouv
 import fiftyone.zoo.datasets as fozd
 import fiftyone.zoo.models as fozm
 
+fouaws = fou.lazy_import("fiftyone.utils.aws")
+
 _TABLE_FORMAT = "simple"
 _MAX_CONSTANT_VALUE_COL_WIDTH = 79
 
@@ -4937,6 +4939,7 @@ class UtilsCommand(Command):
         _register_command(
             subparsers, "compute-metadata", ComputeMetadataCommand
         )
+        _register_command(subparsers, "sync-s3-media", SyncS3MediaCommand)
         _register_command(
             subparsers, "transform-images", TransformImagesCommand
         )
@@ -4997,6 +5000,240 @@ class ComputeMetadataCommand(Command):
             num_workers=args.num_workers,
             skip_failures=args.skip_failures,
         )
+
+
+class SyncS3MediaCommand(Command):
+    """Syncs a dataset with S3-hosted media via a local cache.
+
+    S3 objects are downloaded to a local cache that mirrors their bucket/key
+    structure, each sample's `filepath` is set to its cached path, and its S3
+    URI, which remains the source of truth for the media, is stored in a
+    separate field.
+
+    Samples of an existing dataset whose S3 URI field is empty are backfilled
+    from their current filepath, so this command also migrates existing
+    datasets. Existing S3 URI values are never modified.
+
+    AWS credentials, region, and endpoint are resolved by boto3's standard
+    configuration chain (`AWS_PROFILE`, `AWS_REGION`, `~/.aws/`, etc) unless
+    provided. The cache directory defaults to `fiftyone.config.s3_cache_dir`,
+    which can be set via the `FIFTYONE_S3_CACHE_DIR` environment variable.
+
+    Examples::
+
+        # Create or extend a dataset with the images under an S3 prefix
+        fiftyone utils sync-s3-media <dataset-name> \\
+            --prefix s3://<bucket>/<prefix>/
+
+        # Add the S3 objects listed in a file, one URI per line
+        fiftyone utils sync-s3-media <dataset-name> --uris-file <path>
+
+        # Populate the cache of an existing dataset, re-downloading any
+        # cached files whose size or ETag no longer matches S3
+        fiftyone utils sync-s3-media <dataset-name> --validate etag
+
+        # Preview the migration of a dataset whose filepaths are local
+        # copies of S3 objects, then run it
+        fiftyone utils sync-s3-media <dataset-name> \\
+            --local-root <dir> --s3-root s3://<bucket>/<prefix> --dry-run
+        fiftyone utils sync-s3-media <dataset-name> \\
+            --local-root <dir> --s3-root s3://<bucket>/<prefix>
+    """
+
+    @staticmethod
+    def setup(parser):
+        parser.add_argument(
+            "name", metavar="DATASET_NAME", help="the name of the dataset"
+        )
+        parser.add_argument(
+            "--uris",
+            metavar="S3_URI",
+            nargs="+",
+            help="S3 URIs of objects to add to the dataset",
+        )
+        parser.add_argument(
+            "--uris-file",
+            metavar="PATH",
+            help="a file of S3 URIs of objects to add, one per line",
+        )
+        parser.add_argument(
+            "--prefix",
+            metavar="S3_PREFIX",
+            help="an S3 prefix whose objects to add to the dataset",
+        )
+        parser.add_argument(
+            "--extensions",
+            metavar="EXT",
+            nargs="+",
+            help=(
+                "file extensions of the objects to add from `--prefix`. By "
+                "default, only images are added"
+            ),
+        )
+        parser.add_argument(
+            "--uri-field",
+            metavar="FIELD",
+            default="s3_uri",
+            help="the sample field in which to store the S3 URIs",
+        )
+        parser.add_argument(
+            "--cache-dir",
+            metavar="DIR",
+            help=(
+                "the cache directory. By default, "
+                "`fiftyone.config.s3_cache_dir` is used"
+            ),
+        )
+        parser.add_argument(
+            "--validate",
+            choices=("size", "etag"),
+            help=(
+                "re-download cached files whose size or ETag differs from "
+                "the S3 object's"
+            ),
+        )
+        parser.add_argument(
+            "--local-root",
+            metavar="DIR",
+            help=(
+                "a local directory whose contents mirror `--s3-root`, used to "
+                "backfill the S3 URIs of samples whose media are local copies"
+            ),
+        )
+        parser.add_argument(
+            "--s3-root",
+            metavar="S3_PREFIX",
+            help="the S3 prefix that corresponds to `--local-root`",
+        )
+        parser.add_argument(
+            "--profile", metavar="PROFILE", help="an AWS profile to use"
+        )
+        parser.add_argument(
+            "--region", metavar="REGION", help="an AWS region to use"
+        )
+        parser.add_argument(
+            "--endpoint-url",
+            metavar="URL",
+            help="an S3 endpoint URL to use, e.g. for MinIO",
+        )
+        parser.add_argument(
+            "-n",
+            "--num-workers",
+            default=None,
+            type=int,
+            help="a suggested number of threads to use",
+        )
+        parser.add_argument(
+            "--max-attempts",
+            default=5,
+            type=int,
+            help=(
+                "the maximum number of attempts per object when transient "
+                "errors occur"
+            ),
+        )
+        parser.add_argument(
+            "-s",
+            "--skip-failures",
+            action="store_true",
+            help=(
+                "whether to gracefully continue without raising an error if "
+                "an object cannot be downloaded"
+            ),
+        )
+        parser.add_argument(
+            "--no-metadata",
+            action="store_false",
+            dest="compute_metadata",
+            help="whether to skip computing metadata",
+        )
+        parser.add_argument(
+            "--dry-run",
+            action="store_true",
+            help="only report what would be done, without making changes",
+        )
+
+    @staticmethod
+    def execute(parser, args):
+        client = fouaws.get_s3_client(
+            profile=args.profile,
+            region=args.region,
+            endpoint_url=args.endpoint_url,
+            max_pool_connections=fou.recommend_thread_pool_workers(
+                args.num_workers
+            ),
+        )
+
+        s3_uris = list(args.uris or [])
+
+        if args.uris_file:
+            with open(args.uris_file, "r") as f:
+                s3_uris.extend(line.strip() for line in f if line.strip())
+
+        if args.prefix:
+            s3_uris.extend(
+                fouaws.list_s3_uris(
+                    args.prefix, extensions=args.extensions, client=client
+                )
+            )
+
+        add_uris = bool(args.uris or args.uris_file or args.prefix)
+
+        if fod.dataset_exists(args.name):
+            dataset = fod.load_dataset(args.name)
+        elif not add_uris:
+            raise ValueError(
+                "Dataset '%s' not found. Provide `--prefix`, `--uris`, or "
+                "`--uris-file` to create it" % args.name
+            )
+        elif args.dry_run:
+            print(
+                "Dataset '%s' would be created with %d sample(s)"
+                % (args.name, len(set(s3_uris)))
+            )
+            return
+        else:
+            dataset = fod.Dataset(args.name, persistent=True)
+
+        if add_uris:
+            if args.dry_run:
+                existing = set()
+                if dataset.has_sample_field(args.uri_field):
+                    existing = set(dataset.distinct(args.uri_field))
+
+                num_new = len(set(s3_uris) - existing)
+                print("%d sample(s) would be added" % num_new)
+            else:
+                sample_ids = fouaws.add_s3_samples(
+                    dataset,
+                    s3_uris,
+                    uri_field=args.uri_field,
+                    cache_dir=args.cache_dir,
+                    validate=args.validate,
+                    compute_metadata=args.compute_metadata,
+                    num_workers=args.num_workers,
+                    max_attempts=args.max_attempts,
+                    skip_failures=args.skip_failures,
+                    client=client,
+                )
+                print("Added %d sample(s)" % len(sample_ids))
+
+        summary = fouaws.sync_s3_samples(
+            dataset,
+            uri_field=args.uri_field,
+            cache_dir=args.cache_dir,
+            s3_root=args.s3_root,
+            local_root=args.local_root,
+            validate=args.validate,
+            compute_metadata=args.compute_metadata,
+            dry_run=args.dry_run,
+            num_workers=args.num_workers,
+            max_attempts=args.max_attempts,
+            skip_failures=args.skip_failures,
+            client=client,
+        )
+
+        _print_dict_as_table(summary)
 
 
 class TransformImagesCommand(Command):
